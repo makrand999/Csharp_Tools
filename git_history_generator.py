@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-C# Git History Generator
+C# Git History Generator (optimized)
 
 Creates a realistic git history for C# projects by analyzing folder structure
 and spreading commits across a date range.
@@ -15,480 +15,423 @@ Features:
 Usage options:
 
     1. Interactive mode (prompts for dates):
-
-     1 python3 git_history_generator.py
-    You'll see:
-
-     1 📅 Choose date range option:
-     2    1. Use preset (January - March 2026)
-     3    2. Enter custom start and end dates
-     4    3. Enter start date and number of days
-     5
-     6    Select option [1]:
+       python3 git_history_generator.py
 
     2. Non-interactive (command line args):
-
-     1 python3 git_history_generator.py -s 2026-01-01 -e
-       2026-03-31
-     2 python3 git_history_generator.py -s 2025-12-01 -e
-       2026-02-28
+       python3 git_history_generator.py -s 2026-01-01 -e 2026-03-31
 
     3. Preview first (dry-run):
-
-     1 python3 git_history_generator.py --dry-run
-
-    Features:
-     - ✅ Auto-detects C# projects
-     - ✅ Projects ≤3 files → single commit
-     - ✅ Projects >3 files → batched commits (3 files each)
-     - ✅ Spreads commits evenly across date range
-     - ✅ Interactive or command-line date input
-     - ✅ Handles nested project folders
+       python3 git_history_generator.py --dry-run
 """
 
 import os
 import sys
 import subprocess
 import argparse
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple, Optional
-from dataclasses import dataclass
+from typing import List, Optional
+from dataclasses import dataclass, field
 
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CSharpProject:
-    """Represents a C# project folder."""
     path: Path
     program_number: int
-    category: str
     files: List[Path]
-    file_count: int
+
+    @property
+    def file_count(self) -> int:
+        return len(self.files)
 
 
 @dataclass
 class CommitPlan:
-    """Plans a commit with files and date."""
     files: List[Path]
     date: datetime
     message: str
     program_number: Optional[int] = None
 
 
-def run_git(args: List[str], cwd: str = None, env: dict = None):
-    """Run a git command."""
-    cmd = ["git"] + args
-    subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True)
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+_GIT_ENV_BASE: dict = {}   # populated once in create_git_history
+
+def _run(args: List[str], cwd: str, env: dict = None, capture: bool = True) -> subprocess.CompletedProcess:
+    """Thin wrapper around subprocess.run with sensible defaults."""
+    return subprocess.run(
+        args, cwd=cwd, env=env or _GIT_ENV_BASE,
+        check=True, capture_output=capture,
+    )
+
+
+def _git(args: List[str], cwd: str, env: dict = None) -> subprocess.CompletedProcess:
+    return _run(["git"] + args, cwd=cwd, env=env)
+
+
+def _git_out(args: List[str], cwd: str) -> str:
+    result = _run(["git"] + args, cwd=cwd)
+    return result.stdout.decode().strip()
+
+
+# ---------------------------------------------------------------------------
+# Project discovery
+# ---------------------------------------------------------------------------
+
+_SKIP_DIRS = frozenset({"bin", "obj", ".git"})
 
 
 def find_csharp_projects(root_dir: Path) -> List[CSharpProject]:
     """
-    Find all C# projects anywhere inside root_dir.
-
-    A project is any directory containing at least one .csproj file.
+    Walk the tree once and collect all .csproj directories with their files.
+    Avoids redundant rglob() calls by doing a single os.walk() pass.
     """
+    projects: List[CSharpProject] = []
+    project_roots: List[str] = []          # absolute paths already claimed
 
-    projects = []
-    visited = set()  # prevent nested duplicates
+    # First pass: collect all .csproj directories (sorted for reproducibility)
+    csproj_dirs = sorted(
+        {str(p.parent) for p in root_dir.rglob("*.csproj")},
+        key=lambda d: d.lower(),
+    )
 
-    for csproj in root_dir.rglob("*.csproj"):
-        project_dir = csproj.parent
+    root_str = str(root_dir)
 
-        # Skip if already covered by a parent project
-        if any(str(project_dir).startswith(v) for v in visited):
+    for proj_dir_str in csproj_dirs:
+        # Skip if covered by an already-discovered parent project
+        if any(proj_dir_str.startswith(pr) for pr in project_roots):
             continue
+        project_roots.append(proj_dir_str + os.sep)
 
-        visited.add(str(project_dir))
+        proj_dir = Path(proj_dir_str)
 
-        # Collect files (ignore build + git junk)
-        all_files = [
-            f for f in project_dir.rglob("*")
-            if f.is_file() and not any(p in str(f) for p in ["/bin/", "/obj/", "/.git/"])
-        ]
+        # Collect files with a single walk rooted at this directory
+        all_files: List[Path] = []
+        for dirpath, dirnames, filenames in os.walk(proj_dir_str):
+            # Prune skip dirs in-place (modifying dirnames stops os.walk descent)
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for fname in filenames:
+                all_files.append(Path(dirpath) / fname)
 
-        # Extract program number (optional)
-        prog_num = 0
-        parts = project_dir.name.split("-")
-        if parts[0].isdigit():
-            prog_num = int(parts[0])
+        # Extract optional leading program number from directory name
+        parts = proj_dir.name.split("-")
+        prog_num = int(parts[0]) if parts[0].isdigit() else 0
 
         projects.append(CSharpProject(
-            path=project_dir,
+            path=proj_dir,
             program_number=prog_num,
-            category=project_dir.parent.name,  # dynamic category
             files=all_files,
-            file_count=len(all_files)
         ))
 
-    # Sort safely (projects without numbers go last)
     projects.sort(key=lambda p: (p.program_number == 0, p.program_number))
-
     return projects
 
+
+# ---------------------------------------------------------------------------
+# Commit planning
+# ---------------------------------------------------------------------------
 
 def generate_commit_dates(
     start_date: datetime,
     end_date: datetime,
-    total_commits: int
+    total_commits: int,
 ) -> List[datetime]:
-    """Generate evenly distributed dates across the range."""
     if total_commits <= 1:
         return [start_date]
-    
-    total_days = (end_date - start_date).days
-    if total_days < 1:
-        total_days = 1
-    
-    dates = []
-    for i in range(total_commits):
-        # Spread commits across the date range
-        day_offset = int((i / (total_commits - 1)) * total_days) if total_commits > 1 else 0
-        commit_date = start_date + timedelta(days=day_offset)
-        
-        # Add random-ish time variation
-        hour = 8 + (i % 12)  # 8 AM to 7 PM
-        minute = 15 + (i * 7) % 45  # Distributed minutes
-        
-        commit_date = commit_date.replace(hour=hour, minute=minute, second=0)
-        dates.append(commit_date)
-    
-    return dates
+
+    total_days = max((end_date - start_date).days, 1)
+    n = total_commits - 1
+
+    return [
+        (start_date + timedelta(days=int(i / n * total_days))).replace(
+            hour=8 + (i % 12),
+            minute=15 + (i * 7) % 45,
+            second=0,
+            microsecond=0,
+        )
+        for i in range(total_commits)
+    ]
 
 
 def plan_commits(
     projects: List[CSharpProject],
     start_date: datetime,
-    end_date: datetime
+    end_date: datetime,
 ) -> List[CommitPlan]:
-    """
-    Plan all commits based on project structure.
-    
-    Rules:
-    - Projects with < 3 files: single commit per project
-    - Projects with >= 3 files: group into batches of 3
-    - Tools category: commit all together (small utility scripts)
-    """
-    commit_plans = []
-    
-    # Count total commits needed
-    total_commits = 0
-    for project in projects:
-        if project.file_count < 3:
-            total_commits += 1
-        else:
-            # Group into batches of 3 files
-            batches = (project.file_count + 2) // 3
-            total_commits += batches
-    
-    # Generate dates for all commits
+    # Count total commits upfront
+    total_commits = sum(
+        1 if p.file_count <= 3 else (p.file_count + 2) // 3
+        for p in projects
+    )
+
     commit_dates = generate_commit_dates(start_date, end_date, total_commits)
-    date_index = 0
-    
+    date_idx = 0
+    plans: List[CommitPlan] = []
+
     for project in projects:
+        name = project.path.name
+        num = project.program_number
+
         if project.file_count <= 3:
-            # Small project: single commit with all files
-            commit_plans.append(CommitPlan(
+            plans.append(CommitPlan(
                 files=project.files,
-                date=commit_dates[date_index],
-                message=f"Add program #{project.program_number}: {project.path.name}",
-                program_number=project.program_number
+                date=commit_dates[date_idx],
+                message=f"Add program #{num}: {name}",
+                program_number=num,
             ))
-            date_index += 1
+            date_idx += 1
         else:
-            # Large project: batch commits of 3 files
-            for i in range(0, len(project.files), 3):
-                batch_files = project.files[i:i+3]
-                batch_num = (i // 3) + 1
-                total_batches = (len(project.files) + 2) // 3
-                
-                # Only include program number in first batch
-                if batch_num == 1:
-                    msg = f"Add program #{project.program_number}: {project.path.name} (part {batch_num}/{total_batches})"
-                else:
-                    msg = f"Add program #{project.program_number}: {project.path.name} (part {batch_num}/{total_batches})"
-                
-                commit_plans.append(CommitPlan(
-                    files=batch_files,
-                    date=commit_dates[date_index],
-                    message=msg,
-                    program_number=project.program_number if batch_num == 1 else None
+            total_batches = (project.file_count + 2) // 3
+            for batch_idx, i in enumerate(range(0, project.file_count, 3)):
+                batch_num = batch_idx + 1
+                plans.append(CommitPlan(
+                    files=project.files[i:i + 3],
+                    date=commit_dates[date_idx],
+                    message=(
+                        f"Add program #{num}: {name} (part {batch_num}/{total_batches})"
+                    ),
+                    program_number=num if batch_num == 1 else None,
                 ))
-                date_index += 1
-    
-    return commit_plans
+                date_idx += 1
+
+    return plans
+
+
+# ---------------------------------------------------------------------------
+# Core: create git history
+# ---------------------------------------------------------------------------
+
+_GITIGNORE = "bin/\nobj/\n*.user\n*.suo\n*.cache\n.vs/\n.vscode/\n*.log\n.qwen/\n"
 
 
 def create_git_history(
     root_dir: Path,
     start_date: datetime,
     end_date: datetime,
-    dry_run: bool = False
-):
-    """Create the git history."""
-    
+    dry_run: bool = False,
+) -> None:
+    root_str = str(root_dir)
+
     print(f"📁 Scanning for C# projects in: {root_dir}")
     projects = find_csharp_projects(root_dir)
     print(f"✅ Found {len(projects)} C# projects")
-    
+
     if not projects:
         print("❌ No C# projects found!")
         return
-    
-    # Show project summary
-    print("\n📊 Project Summary:")
+
+    print("\n📊 Project summary:")
     for proj in projects[:5]:
         print(f"   #{proj.program_number}: {proj.path.name} ({proj.file_count} files)")
     if len(projects) > 5:
         print(f"   ... and {len(projects) - 5} more")
-    
-    print(f"\n📅 Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-    
-    # Plan commits
+
+    print(f"\n📅 Date range: {start_date:%Y-%m-%d} → {end_date:%Y-%m-%d}")
+
     commit_plans = plan_commits(projects, start_date, end_date)
     print(f"📝 Planned {len(commit_plans)} commits")
-    
+
     if dry_run:
-        print("\n🔍 DRY RUN - Commit plan:")
+        print("\n🔍 DRY RUN — commit plan (first 10):")
         for i, plan in enumerate(commit_plans[:10]):
-            print(f"   {i+1}. {plan.date.strftime('%Y-%m-%d %H:%M')} - {plan.message}")
+            print(f"   {i+1:3d}. {plan.date:%Y-%m-%d %H:%M}  {plan.message}")
             for f in plan.files[:3]:
-                print(f"      - {f.relative_to(root_dir)}")
+                print(f"         {f.relative_to(root_dir)}")
             if len(plan.files) > 3:
-                print(f"      ... and {len(plan.files) - 3} more files")
+                print(f"         … and {len(plan.files) - 3} more")
         if len(commit_plans) > 10:
-            print(f"   ... and {len(commit_plans) - 10} more commits")
+            print(f"   … and {len(commit_plans) - 10} more commits")
         return
-    
-    # Initialize git repo
-    print("\n🔧 Initializing git repository...")
-    run_git(["init"], cwd=str(root_dir))
-    run_git(["config", "user.email", "dev@example.com"], cwd=str(root_dir))
-    run_git(["config", "user.name", "Developer"], cwd=str(root_dir))
-    
-    # Create .gitignore
-    gitignore_content = """bin/
-obj/
-*.user
-*.suo
-*.cache
-.vs/
-.vscode/
-*.log
-.qwen/
-"""
-    gitignore_path = root_dir / ".gitignore"
-    gitignore_path.write_text(gitignore_content)
-    
-    # Initial commit
-    run_git(["add", ".gitignore"], cwd=str(root_dir))
-    env = os.environ.copy()
-    env["GIT_AUTHOR_DATE"] = start_date.strftime("%Y-%m-%dT%H:%M:%S")
-    env["GIT_COMMITTER_DATE"] = start_date.strftime("%Y-%m-%dT%H:%M:%S")
-    run_git(
-        ["commit", "-m", "Initial commit: Project setup"],
-        cwd=str(root_dir),
-        env=env
-    )
+
+    # ------------------------------------------------------------------
+    # Initialise repo
+    # ------------------------------------------------------------------
+    print("\n🔧 Initialising git repository…")
+    _git(["init"], root_str)
+    _git(["config", "user.email", "dev@example.com"], root_str)
+    _git(["config", "user.name", "Developer"], root_str)
+
+    (root_dir / ".gitignore").write_text(_GITIGNORE)
+
+    init_env = {**os.environ,
+                "GIT_AUTHOR_DATE": start_date.strftime("%Y-%m-%dT%H:%M:%S"),
+                "GIT_COMMITTER_DATE": start_date.strftime("%Y-%m-%dT%H:%M:%S")}
+    _git(["add", ".gitignore"], root_str)
+    _git(["commit", "-m", "Initial commit: Project setup"], root_str, env=init_env)
     print("✅ Initial commit created")
-    
-    # Create commits
-    print("\n📦 Creating commits...")
+
+    # ------------------------------------------------------------------
+    # Batch commits — key optimisations:
+    #   1. `git add --` with multiple paths in ONE subprocess call per batch
+    #   2. Check `git status --porcelain` once per batch (not per file)
+    #   3. Build the env dict once per commit (reuse os.environ copy)
+    # ------------------------------------------------------------------
+    print("\n📦 Creating commits…")
+    total = len(commit_plans)
+    skipped = 0
+
+    base_env = os.environ.copy()   # copy once; mutate two keys per iteration
+
     for i, plan in enumerate(commit_plans):
-        # Stage files
+        # Convert all file paths to repo-relative strings in one pass
+        rel_paths: List[str] = []
         for f in plan.files:
             try:
-                rel_path = f.relative_to(root_dir)
-                run_git(["add", str(rel_path)], cwd=str(root_dir))
+                rel_paths.append(str(f.relative_to(root_dir)))
             except ValueError:
-                pass  # File outside repo
-        
-        # Check if there's anything to commit
-        result = subprocess.run(
+                pass
+
+        if rel_paths:
+            # Single subprocess call for all files in this batch
+            _git(["add", "--"] + rel_paths, root_str)
+
+        # Check staging area before committing
+        status = subprocess.run(
             ["git", "status", "--porcelain"],
-            cwd=str(root_dir),
-            capture_output=True,
-            text=True
+            cwd=root_str, capture_output=True, text=True,
         )
-        if not result.stdout.strip():
-            continue  # Nothing to commit
-        
-        # Set commit date
-        env = os.environ.copy()
-        env["GIT_AUTHOR_DATE"] = plan.date.strftime("%Y-%m-%dT%H:%M:%S")
-        env["GIT_COMMITTER_DATE"] = plan.date.strftime("%Y-%m-%dT%H:%M:%S")
-        
-        run_git(["commit", "-m", plan.message], cwd=str(root_dir), env=env)
-        
-        # Progress indicator
-        if (i + 1) % 50 == 0 or i == len(commit_plans) - 1:
-            print(f"   Committed {i + 1}/{len(commit_plans)} ({plan.date.strftime('%Y-%m-%d')})")
-    
+        if not status.stdout.strip():
+            skipped += 1
+            continue
+
+        date_str = plan.date.strftime("%Y-%m-%dT%H:%M:%S")
+        commit_env = {**base_env,
+                      "GIT_AUTHOR_DATE": date_str,
+                      "GIT_COMMITTER_DATE": date_str}
+        _git(["commit", "-m", plan.message], root_str, env=commit_env)
+
+        # Inline progress (no newline spam)
+        done = i + 1
+        if done % 10 == 0 or done == total:
+            pct = done * 100 // total
+            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+            print(f"\r   [{bar}] {done}/{total} ({plan.date:%Y-%m-%d})", end="", flush=True)
+
+    print()  # newline after progress bar
+
+    # ------------------------------------------------------------------
     # Summary
-    print("\n✅ Git history created successfully!")
-    
-    # Show stats
-    result = subprocess.run(
-        ["git", "rev-list", "--count", "HEAD"],
-        cwd=str(root_dir),
-        capture_output=True,
-        text=True
-    )
-    total_commits = int(result.stdout.strip())
-    
-    result = subprocess.run(
-        ["git", "log", "--reverse", "--format=%ad", "--date=short"],
-        cwd=str(root_dir),
-        capture_output=True,
-        text=True
-    )
-    first_date = result.stdout.strip().split("\n")[0] if result.stdout.strip() else "N/A"
-    
-    result = subprocess.run(
-        ["git", "log", "--format=%ad", "--date=short"],
-        cwd=str(root_dir),
-        capture_output=True,
-        text=True
-    )
-    last_date = result.stdout.strip().split("\n")[0] if result.stdout.strip() else "N/A"
-    
-    print(f"\n📊 Statistics:")
-    print(f"   Total commits: {total_commits}")
-    print(f"   Date range: {first_date} to {last_date}")
-    
+    # ------------------------------------------------------------------
+    total_commits = int(_git_out(["rev-list", "--count", "HEAD"], root_str))
+    first_date = _git_out(["log", "--reverse", "--format=%ad", "--date=short"], root_str).split("\n")[0]
+    last_date  = _git_out(["log", "--format=%ad", "--date=short"], root_str).split("\n")[0]
+
+    print(f"\n✅ Done! {total_commits} commits ({first_date} → {last_date})")
+    if skipped:
+        print(f"   ℹ️  {skipped} batches skipped (nothing to stage)")
+
     print("\n📜 Last 5 commits:")
-    result = subprocess.run(
-        ["git", "log", "--oneline", "-5"],
-        cwd=str(root_dir),
-        capture_output=True,
-        text=True
-    )
-    for line in result.stdout.strip().split("\n"):
+    for line in _git_out(["log", "--oneline", "-5"], root_str).split("\n"):
         print(f"   {line}")
 
 
-def get_date_input(prompt: str, default: str) -> datetime:
-    """Prompt user for a date with a default value."""
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def _parse_date(s: str) -> datetime:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid date '{s}'. Use YYYY-MM-DD.")
+
+
+def _prompt_date(prompt: str, default: str) -> datetime:
     while True:
-        user_input = input(f"{prompt} [{default}]: ").strip()
-        date_str = user_input if user_input else default
-        
+        raw = input(f"{prompt} [{default}]: ").strip() or default
         try:
-            return datetime.strptime(date_str, "%Y-%m-%d")
+            return datetime.strptime(raw, "%Y-%m-%d")
         except ValueError:
-            print("   ❌ Invalid format. Please use YYYY-MM-DD (e.g., 2026-01-01)")
+            print("   ❌ Use YYYY-MM-DD (e.g. 2026-01-15)")
 
 
-def get_timespan_input() -> tuple[datetime, datetime]:
-    """Prompt user for timespan options."""
-    print("\n📅 Choose date range option:")
-    print("   1. Use preset (January - March 2026)")
-    print("   2. Enter custom start and end dates")
-    print("   3. Enter start date and number of days")
-    
-    choice = input("\n   Select option [1]: ").strip() or "1"
-    
+def _prompt_timespan() -> tuple[datetime, datetime]:
+    print("\n📅 Choose date range:")
+    print("   1. Preset  (2026-01-01 → 2026-03-31)")
+    print("   2. Custom start + end dates")
+    print("   3. Start date + number of days")
+
+    choice = input("\n   Select [1]: ").strip() or "1"
+
     if choice == "2":
-        start = get_date_input("   Start date", "2026-01-01")
-        end = get_date_input("   End date", "2026-03-31")
+        start = _prompt_date("   Start date", "2026-01-01")
+        end   = _prompt_date("   End date",   "2026-03-31")
         return start, end
-    elif choice == "3":
-        start = get_date_input("   Start date", "2026-01-01")
-        days_str = input("   Number of days [90]: ").strip() or "90"
+
+    if choice == "3":
+        start = _prompt_date("   Start date", "2026-01-01")
+        raw = input("   Number of days [90]: ").strip() or "90"
         try:
-            days = int(days_str)
-            end = start + timedelta(days=days)
-            return start, end
+            days = int(raw)
         except ValueError:
-            print("   ❌ Invalid number, using 90 days")
-            return start, start + timedelta(days=90)
-    else:
-        # Default: Jan 1 - Mar 31, 2026 (90 days)
-        return datetime(2026, 1, 1), datetime(2026, 3, 31)
+            print("   ❌ Using 90 days")
+            days = 90
+        return start, start + timedelta(days=days)
+
+    return datetime(2026, 1, 1), datetime(2026, 3, 31)
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Create realistic git history for C# projects",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                          # Interactive mode (prompts for dates)
-  %(prog)s -s 2026-01-01 -e 2026-03-31  # Non-interactive
-  %(prog)s --start 2025-12-01 --end 2026-02-28
-  %(prog)s --dry-run                # Preview without creating commits
-        """
+  %(prog)s                                  # interactive
+  %(prog)s -s 2026-01-01 -e 2026-03-31     # non-interactive
+  %(prog)s --dry-run                        # preview only
+        """,
     )
-    
-    parser.add_argument(
-        "-d", "--directory",
-        type=Path,
-        default=Path("."),
-        help="Root directory of C# projects (default: current directory)"
-    )
-    
-    parser.add_argument(
-        "-s", "--start",
-        type=str,
-        default=None,
-        help="Start date YYYY-MM-DD (default: prompt user)"
-    )
-    
-    parser.add_argument(
-        "-e", "--end",
-        type=str,
-        default=None,
-        help="End date YYYY-MM-DD (default: prompt user)"
-    )
-    
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview commit plan without creating commits"
-    )
-    
-    parser.add_argument(
-        "-i", "--interactive",
-        action="store_true",
-        help="Force interactive mode (prompt for all options)"
-    )
-    
-    parser.add_argument(
-        "--interactive-mode",
-        action="store_true",
-        help="Same as -i, force interactive mode"
-    )
-    
+    parser.add_argument("-d", "--directory", type=Path, default=Path("."),
+                        help="Root directory (default: current dir)")
+    parser.add_argument("-s", "--start", type=str, default=None,
+                        help="Start date YYYY-MM-DD")
+    parser.add_argument("-e", "--end",   type=str, default=None,
+                        help="End date YYYY-MM-DD")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Preview without creating commits")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="Force interactive date prompts")
+
     args = parser.parse_args()
-    
-    # Get dates (interactive or from args)
-    if args.interactive or args.interactive_mode or not args.start or not args.end:
-        start_date, end_date = get_timespan_input()
+
+    # Resolve dates
+    if args.interactive or not (args.start and args.end):
+        start_date, end_date = _prompt_timespan()
     else:
         try:
             start_date = datetime.strptime(args.start, "%Y-%m-%d")
-            end_date = datetime.strptime(args.end, "%Y-%m-%d")
-        except ValueError as e:
-            print(f"❌ Invalid date format. Use YYYY-MM-DD")
+            end_date   = datetime.strptime(args.end,   "%Y-%m-%d")
+        except ValueError:
+            print("❌ Invalid date format — use YYYY-MM-DD")
             sys.exit(1)
-    
+
     if start_date > end_date:
         print("❌ Start date must be before end date")
         sys.exit(1)
-    
-    # Resolve directory
+
     root_dir = args.directory.resolve()
     if not root_dir.exists():
         print(f"❌ Directory not found: {root_dir}")
         sys.exit(1)
-    
-    # Remove existing .git if present
+
+    # Remove stale .git
     git_dir = root_dir / ".git"
     if git_dir.exists():
-        import shutil
-        print(f"🗑️  Removing existing .git directory...")
+        print("🗑️  Removing existing .git directory…")
         shutil.rmtree(git_dir)
-    
-    # Create history
+
     create_git_history(root_dir, start_date, end_date, args.dry_run)
 
 
